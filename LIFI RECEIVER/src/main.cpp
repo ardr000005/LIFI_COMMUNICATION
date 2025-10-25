@@ -1,64 +1,129 @@
 #include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
 
 const int ADC_PIN = 34;
 const int BIT_DELAY = 300;
 const int SAMPLES_PER_BIT = 5;
-const unsigned long LETTER_GAP_MS = 8000;  // 8 seconds
+const unsigned long LETTER_GAP_MS = 8000;
 const int SIGNAL_THRESHOLD_DIFF = 500;
+const int CALIBRATION_SAMPLES = 100;
+
+// Bluetooth definitions
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 int lightLevel, darkLevel, threshold;
 String msg = "";
 unsigned long lastCharTime = 0;
 bool signalInverted = false;
+bool firstCharReceived = false; // Track if we've received the first dummy character
+char firstActualChar = 0; // Store the first actual character to remove it later
 
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n--- Li-Fi Receiver (FINAL CORRECTED) ---");
-  Serial.println("Calibrating... Point laser directly at photodiode");
+BLEServer *pServer = NULL;
+BLECharacteristic *pTxCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
 
-  // Calibrate with laser OFF (dark)
-  Serial.println("Ensure laser is OFF for dark calibration...");
-  delay(3000);
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("Device connected");
+    }
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("Device disconnected");
+    }
+};
+
+void autoCalibrate() {
+  Serial.println("Auto-calibrating... Please ensure laser is OFF");
+  
+  // Measure ambient light (laser OFF)
   darkLevel = 0;
-  for (int i = 0; i < 50; i++) {
+  for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
     darkLevel += analogRead(ADC_PIN);
-    delay(50);
+    delay(20);
+    
+    // Show progress
+    if (i % 20 == 0) {
+      Serial.printf("Calibrating dark level... %d%%\n", (i * 100) / CALIBRATION_SAMPLES);
+    }
   }
-  darkLevel /= 50;
-
-  // Calibrate with laser ON (light)
-  Serial.println("Now turn laser ON for light calibration...");
-  delay(3000);
-  lightLevel = 0;
-  for (int i = 0; i < 50; i++) {
-    lightLevel += analogRead(ADC_PIN);
-    delay(50);
+  darkLevel /= CALIBRATION_SAMPLES;
+  
+  Serial.println("Now calibrating light level... Please turn laser ON");
+  Serial.println("Waiting for laser signal...");
+  
+  // Wait for laser signal and measure
+  unsigned long startTime = millis();
+  bool laserDetected = false;
+  
+  while (millis() - startTime < 10000) { // Wait up to 10 seconds for laser
+    int currentValue = analogRead(ADC_PIN);
+    
+    // Check if laser is detected (significant change from dark level)
+    if (abs(currentValue - darkLevel) > SIGNAL_THRESHOLD_DIFF) {
+      laserDetected = true;
+      Serial.println("Laser detected! Measuring light level...");
+      break;
+    }
+    
+    delay(100);
+    
+    // Show we're waiting
+    if ((millis() - startTime) % 2000 == 0) {
+      Serial.println("Waiting for laser signal...");
+    }
   }
-  lightLevel /= 50;
-
-  // Set threshold
+  
+  if (!laserDetected) {
+    Serial.println("WARNING: No laser detected. Using estimated values.");
+    // Estimate light level based on typical difference
+    lightLevel = darkLevel + 800; // Conservative estimate
+  } else {
+    // Measure with laser ON
+    lightLevel = 0;
+    for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+      lightLevel += analogRead(ADC_PIN);
+      delay(20);
+      
+      if (i % 20 == 0) {
+        Serial.printf("Calibrating light level... %d%%\n", (i * 100) / CALIBRATION_SAMPLES);
+      }
+    }
+    lightLevel /= CALIBRATION_SAMPLES;
+  }
+  
   threshold = (lightLevel + darkLevel) / 2;
   
-  Serial.printf("Dark level: %d, Light level: %d\n", darkLevel, lightLevel);
-  Serial.printf("Threshold: %d, Difference: %d\n", threshold, abs(lightLevel - darkLevel));
-
+  Serial.printf("\n=== CALIBRATION RESULTS ===\n");
+  Serial.printf("Dark level (laser OFF): %d\n", darkLevel);
+  Serial.printf("Light level (laser ON): %d\n", lightLevel);
+  Serial.printf("Threshold: %d\n", threshold);
+  Serial.printf("Signal difference: %d\n", abs(lightLevel - darkLevel));
+  
   if (abs(lightLevel - darkLevel) < SIGNAL_THRESHOLD_DIFF) {
-    Serial.println("ERROR: Signal difference too small!");
+    Serial.println("WARNING: Signal difference may be too small for reliable reception");
     Serial.println("Check laser alignment and photodiode connection");
-    while(1) delay(1000);
-  }
-
-  // Determine if signal is inverted
-  if (lightLevel < darkLevel) {
-    signalInverted = true;
-    Serial.println("Signal: INVERTED (laser ON = lower voltage)");
   } else {
-    signalInverted = false;
-    Serial.println("Signal: NORMAL (laser ON = higher voltage)");
+    Serial.println("Signal strength: GOOD");
   }
+  
+  signalInverted = (lightLevel < darkLevel);
+  Serial.println(signalInverted ? "Signal: INVERTED" : "Signal: NORMAL");
+  Serial.println("============================\n");
+}
 
-  Serial.println("Ready! Waiting for transmission...");
+void sendToBluetooth(const String &message) {
+  if (deviceConnected && pTxCharacteristic != NULL) {
+    pTxCharacteristic->setValue(message.c_str());
+    pTxCharacteristic->notify();
+    Serial.println("BT Sent: " + message);
+  }
 }
 
 int readSignal() {
@@ -72,22 +137,24 @@ bool waitForStartBit() {
   int consecutiveZeros = 0;
   int samples = 0;
   
-  while (millis() - startTime < 3000) {
-    if (readSignal() == 0) {
+  while (millis() - startTime < 5000) {
+    int signal = readSignal();
+    
+    if (signal == 0) {
       consecutiveZeros++;
       if (consecutiveZeros >= 2) {
-        // Found potential start bit, wait to center in the bit
+        Serial.println("\n[START BIT DETECTED]");
         delay(BIT_DELAY * 0.75);
         return true;
       }
     } else {
       consecutiveZeros = 0;
     }
+    
     delay(BIT_DELAY / 4);
     samples++;
     
-    // Show we're alive
-    if (samples % 10 == 0) {
+    if (samples % 20 == 0) {
       Serial.print(".");
       samples = 0;
     }
@@ -107,46 +174,118 @@ int readBit() {
 bool receiveByte(byte &result) {
   result = 0;
   
-  // Read 8 data bits (LSB FIRST to match transmitter)
   for (int i = 0; i < 8; i++) {
     int bitValue = readBit();
-    result |= (bitValue << i);  // LSB first
+    result |= (bitValue << i);
   }
   
-  // Read stop bit
   int stopBit = readBit();
+  return (stopBit == 1);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
   
-  return (stopBit == 1);  // Valid if stop bit is 1
+  Serial.println("\n--- Li-Fi Receiver with Bluetooth ---");
+  
+  // Bluetooth setup first
+  BLEDevice::init("LiFi_Receiver");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pTxCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID_TX,
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+
+  pService->createCharacteristic(
+    CHARACTERISTIC_UUID_RX,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  BLEDevice::startAdvertising();
+
+  // Auto-calibration
+  autoCalibrate();
+  
+  sendToBluetooth("Receiver Ready - Calibration Complete");
+  Serial.println("Ready! Waiting for Li-Fi transmission...");
 }
 
 void loop() {
-  if (waitForStartBit()) {
-    Serial.print("\n[START] ");
-    
+  if (waitForStartBit()) {    
     byte receivedByte;
     if (receiveByte(receivedByte)) {
-      // Store the character
-      if (isprint(receivedByte)) {
-        msg += (char)receivedByte;
-        Serial.printf("Received: '%c' (0x%02X)\n", receivedByte, receivedByte);
+      // Skip the first dummy character '#'
+      if (!firstCharReceived) {
+        Serial.printf("Dummy character received: '%c' (0x%02X) - IGNORED\n", receivedByte, receivedByte);
+        firstCharReceived = true;
       } else {
-        msg += "[" + String(receivedByte, HEX) + "]";
-        Serial.printf("Received: 0x%02X (non-printable)\n", receivedByte);
+        // Store the first actual character separately
+        if (msg.length() == 0) {
+          firstActualChar = receivedByte;
+          Serial.printf("First actual character stored: '%c' (0x%02X) - WILL BE REMOVED LATER\n", receivedByte, receivedByte);
+        }
+        
+        // This is the actual data - add everything to message
+        if (isprint(receivedByte)) {
+          msg += (char)receivedByte;
+          Serial.printf("Received char: '%c' (0x%02X)\n", receivedByte, receivedByte);
+        } else {
+          msg += "[" + String(receivedByte, HEX) + "]";
+          Serial.printf("Received hex: 0x%02X\n", receivedByte);
+        }
+        
+        lastCharTime = millis();
+        Serial.printf("Current message: '%s'\n", msg.c_str());
       }
-      
-      lastCharTime = millis();
-      Serial.printf("Message so far: '%s'\n", msg.c_str());
     } else {
       Serial.println("FRAME ERROR - Bad stop bit");
+      sendToBluetooth("ERROR: Frame error");
     }
   }
   
   // Check if message is complete (no data for a while)
   if (msg.length() > 0 && (millis() - lastCharTime > LETTER_GAP_MS)) {
-    Serial.println("\n=== COMPLETE MESSAGE ===");
-    Serial.println(msg);
-    Serial.println("========================");
+    Serial.println("\n=== COMPLETE MESSAGE RECEIVED ===");
+    Serial.println("Original: " + msg);
+    
+    // SIMPLE FIX: Remove the first character from the message
+    String finalMessage = msg;
+    if (finalMessage.length() > 0) {
+      finalMessage = finalMessage.substring(1); // Remove first character
+      Serial.println("After removing first char: " + finalMessage);
+    }
+    
+    Serial.println("=================================");
+    
+    // Send cleaned message to Bluetooth
+    sendToBluetooth(finalMessage);
+    
+    // Reset for next transmission
+    firstCharReceived = false;
+    firstActualChar = 0;
     msg = "";
     Serial.println("Ready for next message...");
   }
+  
+  // Handle Bluetooth connection
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500);
+    pServer->startAdvertising();
+    Serial.println("Bluetooth advertising started");
+    oldDeviceConnected = deviceConnected;
+  }
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+  
+  delay(10);
 }

@@ -1,0 +1,19 @@
+name: lifi_communicator
+description: Li-Fi Communication App
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  permission_handler: ^11.0.1
+  flutter_blue_plus: ^1.30.1
+  pointycastle: ^3.7.3
+  crypto: ^3.0.3
+  shared_preferences: ^2.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
