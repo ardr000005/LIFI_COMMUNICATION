@@ -115,7 +115,7 @@ flutter run
 - Align LED and photodiode directly with minimal ambient light
 
 ### 4. Run Flutter App
-- Pair your app with the ESP32 devices via serial/Wi-Fi
+- Pair your app with the ESP32 devices via bluetooth
 - Choose Transmitter or Receiver mode
 - Start sending and receiving messages using light!
 
