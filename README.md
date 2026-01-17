@@ -29,6 +29,17 @@ LIFI_COMMUNICATION/
 - 🧠 **Low-Cost Prototype** – Compact, affordable, and suitable for educational or research demonstrations
 
 ---
+##🔌 Circuit Schematics
+
+<h3>🔷 Transmitter Schematic</h3>
+<p align="center">
+  <img src="assets/Schematic_Transmitter.png" width="700">
+</p>
+
+<h3>🔶 Receiver Schematic</h3>
+<p align="center">
+  <img src="assets/Schematic_Receiver.png" width="700">
+</p>
 
 ## 🧠 Working Principle
 
